@@ -4,9 +4,9 @@ use crate::{
     Error, Notification, UserFills, UserFundings, UserNonFundingLedgerUpdates,
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use log::error;
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{borrow::BorrowMut, collections::HashMap, ops::DerefMut, sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
     spawn,
@@ -18,13 +18,13 @@ use tokio_tungstenite::{
     tungstenite::{self, protocol},
     MaybeTlsStream, WebSocketStream,
 };
-
 use ethers::types::H160;
 
 #[derive(Debug)]
 struct SubscriptionData {
     sending_channel: UnboundedSender<Message>,
     subscription_id: u32,
+    identifier : String,
 }
 pub(crate) struct WsManager {
     writer: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, protocol::Message>>>,
@@ -65,6 +65,7 @@ pub enum Message {
     UserNonFundingLedgerUpdates(UserNonFundingLedgerUpdates),
     Notification(Notification),
     Pong,
+    Disconnect
 }
 
 #[derive(Serialize)]
@@ -82,27 +83,57 @@ impl WsManager {
     const SEND_PING_INTERVAL: u64 = 50;
 
     pub(crate) async fn new(url: String) -> Result<WsManager> {
-        let (ws_stream, _) = connect_async(url.clone())
-            .await
-            .map_err(|e| Error::Websocket(e.to_string()))?;
-
-        let (writer, mut reader) = ws_stream.split();
+        
+        let (writer, mut reader) = Self::connect(url.as_str()).await?.split();
         let writer = Arc::new(Mutex::new(writer));
 
         let subscriptions_map: HashMap<String, Vec<SubscriptionData>> = HashMap::new();
         let subscriptions = Arc::new(Mutex::new(subscriptions_map));
         let subscriptions_copy = Arc::clone(&subscriptions);
 
-        let reader_fut = async move {
-            // TODO: reconnect
-            loop {
-                let data = reader.next().await;
-                if let Err(err) = WsManager::parse_and_send_data(data, &subscriptions_copy).await {
-                    error!("Error processing data received by WS manager reader: {err}");
+        {
+            let writer = writer.clone();
+            let reader_fut = async move {
+                loop {
+                    let data = reader.next().await;
+                    if data.is_none() {
+                        warn!("WS Manager disconnect");
+                        for (_, v) in subscriptions_copy.lock().await.iter() {
+                            for data in v.iter() {
+                                if let Err(err) = data.sending_channel.send(Message::Disconnect) {
+                                    warn!("Error sending disconnection notification {err}");
+                                }
+                            }
+                        }
+                        match Self::connect(url.as_str()).await {
+                            Ok(ws) => {
+                                let (writer_inner, reader_inner) = ws.split();
+                                reader = reader_inner;
+                                let mut writer_guard = writer.lock().await;
+                                *writer_guard = writer_inner;
+                                for (identifier, v) in subscriptions_copy.lock().await.iter() {
+                                    if identifier.eq("userEvents") || identifier.eq("orderUpdates") { //TODO should these special keys be removed and instead use the simpler direct identifier mapping?
+                                        for data in v.iter() { 
+                                            if let Err(error) = Self::send_subscribe(writer_guard.deref_mut(), &data.identifier).await {
+                                                warn!("Could not resubscribe correctly {identifier}: {error}");
+                                            }
+                                        }
+                                    }
+                                    else if let Err(error) = Self::send_subscribe(writer_guard.deref_mut(), identifier).await {
+                                        warn!("Could not resubscribe correctly {identifier}: {error}");
+                                    }
+                                }
+                            },
+                            Err(err) => error!("Could not connect to websocket {err}"),
+                        }
+                    }
+                    else if let Err(err) = WsManager::parse_and_send_data(data, &subscriptions_copy).await {
+                        error!("Error processing data received by WS manager reader: {err}");
+                    }
                 }
-            }
-        };
-        spawn(reader_fut);
+            };
+            spawn(reader_fut);
+        }
 
         {
             let writer = Arc::clone(&writer);
@@ -129,6 +160,12 @@ impl WsManager {
             subscription_id: 0,
             subscription_identifiers: HashMap::new(),
         })
+    }
+
+    async fn connect(url : &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        Ok(connect_async(url )
+            .await
+            .map_err(|e| Error::Websocket(e.to_string()))?.0)
     }
 
     fn get_identifier(message: &Message) -> Result<String> {
@@ -166,6 +203,7 @@ impl WsManager {
             }
             Message::Notification(_) => Ok("notification".to_string()),
             Message::SubscriptionResponse | Message::Pong => Ok(String::default()),
+            Message::Disconnect => Ok(String::default()),
         }
     }
 
@@ -204,6 +242,21 @@ impl WsManager {
         res
     }
 
+    async fn send_subscribe(writer : &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, protocol::Message>, identifier : &str) -> Result<()> {
+        let payload = serde_json::to_string(&SubscriptionSendData {
+            method: "subscribe",
+            subscription: &serde_json::from_str::<serde_json::Value>(identifier)
+                .map_err(|e| Error::JsonParse(e.to_string()))?,
+        })
+        .map_err(|e| Error::JsonParse(e.to_string()))?;
+
+        writer
+            .send(protocol::Message::Text(payload))
+            .await
+            .map_err(|e| Error::Websocket(e.to_string()))?;
+        Ok(())
+    }
+
     pub(crate) async fn add_subscription(
         &mut self,
         identifier: String,
@@ -233,18 +286,7 @@ impl WsManager {
         }
 
         if subscriptions.is_empty() {
-            let payload = serde_json::to_string(&SubscriptionSendData {
-                method: "subscribe",
-                subscription: &serde_json::from_str::<serde_json::Value>(&identifier)
-                    .map_err(|e| Error::JsonParse(e.to_string()))?,
-            })
-            .map_err(|e| Error::JsonParse(e.to_string()))?;
-
-            let mut writer = self.writer.lock().await;
-            writer
-                .send(protocol::Message::Text(payload))
-                .await
-                .map_err(|e| Error::Websocket(e.to_string()))?;
+            Self::send_subscribe(self.writer.lock().await.borrow_mut(), identifier.as_str()).await?;
         }
 
         let subscription_id = self.subscription_id;
@@ -253,6 +295,7 @@ impl WsManager {
         subscriptions.push(SubscriptionData {
             sending_channel,
             subscription_id,
+            identifier,
         });
 
         self.subscription_id += 1;
