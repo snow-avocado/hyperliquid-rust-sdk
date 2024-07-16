@@ -107,6 +107,7 @@ impl WsManager {
                         }
                         match Self::connect(url.as_str()).await {
                             Ok(ws) => {
+                                warn!("WS Manager Reconnected. Resubscribe pending.");
                                 let (writer_inner, reader_inner) = ws.split();
                                 reader = reader_inner;
                                 let mut writer_guard = writer.lock().await;
@@ -123,6 +124,7 @@ impl WsManager {
                                         warn!("Could not resubscribe correctly {identifier}: {error}");
                                     }
                                 }
+                                warn!("Reconnected and resubscribed to all subscriptions");
                             },
                             Err(err) => error!("Could not connect to websocket {err}"),
                         }
